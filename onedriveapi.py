@@ -16,8 +16,18 @@ url = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?response_t
 settings = {}
 tokenstream = {}
 downloadinfos = []
-semlock = ""
+semlockdownload = ""
+upload_thread_pool = []
+download_thread_pool = []
+semlockupload = ""
 tokenjson = {}
+
+#上传成功时删除文件
+def deletefile(filepath):
+    try:
+        os.remove(filepath)  # 删除文件
+    except Exception as e:
+        print("remove file error %s" % e.__str__)
 
 class MulThreadDownload(threading.Thread):
     def __init__(self, url, startpos, endpos, f):
@@ -28,7 +38,7 @@ class MulThreadDownload(threading.Thread):
         self.fd = f
 
     def download(self):
-        global semlock
+        global semlockdownload
         # print("start thread:%s at %s" % (self.getName(), time.time()))
         headers = {"Range": "bytes=%s-%s" % (self.startpos, self.endpos)}
         trytimes = 0
@@ -46,7 +56,7 @@ class MulThreadDownload(threading.Thread):
         # 所以下面是直接write(res.content)
         self.fd.seek(self.startpos)
         self.fd.write(res.content)
-        semlock.release()
+        semlockdownload.release()
         # print("stop thread:%s at %s" % (self.getName(), time.time()))
         self.fd.close()
 
@@ -54,10 +64,80 @@ class MulThreadDownload(threading.Thread):
         self.download()
 
 
+class MulThreadUpload(threading.Thread):
+    def __init__(self, remotePath, filename, target_filename):
+        super(MulThreadUpload, self).__init__()
+        self.remotePath = remotePath
+        self.filename = filename
+        self.target_filename = target_filename
+
+    def upload(self):
+        global tokenjson
+        global semlockupload
+
+        ret = False
+        trytime = 0
+
+        while True:
+            if self.remotePath == "None":
+                self.remotePath = "/"
+            url = config.app_url + \
+                '/v1.0/me/drive/items/root:{}/{}:/content'.format(urllib.parse.quote(self.remotePath), urllib.parse.quote(self.filename))
+
+            while True:
+                headers = {
+                    'Authorization':
+                    'bearer {}'.format(tokenjson["access_token"]),
+                    'Content-Type': 'application/octet-stream',
+                }
+                try:
+                    pull_res = requests.put(url,
+                                            headers=headers,
+                                            data=open(self.target_filename, 'rb'),
+                                            timeout=30)
+                    break
+                except Exception as e:
+                    if (trytime > 99999):
+                        return False
+                    print("putfilesmall connect error try next")
+                    print(e.__str__)
+                    time.sleep(20)
+                    trytime = trytime + 1
+                    continue
+
+            pull_res = json.loads(pull_res.text)
+            if 'error' in pull_res.keys():
+                if (trytime > 99999):
+                    break
+                print("putfilesmall ret error %s" % pull_res)
+                reacquireToken()
+                trytime = trytime + 1
+            else:
+                ret = True
+                break
+
+        semlockupload.release()
+        if ret is True:
+            deletefile(self.target_filename)
+        return ret
+
+    def run(self):
+        self.upload()
+
+#如果是大文件等待下载完毕再返回，否则立即返回
 def down_file(url, filepathdir, filename, filesize):
-    global semlock
+    global semlockdownload
+    global download_thread_pool
+
+    if len(download_thread_pool) > 50:
+        for i in download_thread_pool:
+            i.join()
+        download_thread_pool.clear()
+
     # 获取文件的大小和文件名
     filefullpath = filepathdir + filename
+    print("down_file download:%s" % filefullpath)
+
     if not os.path.exists(filepathdir):
         # 如果不存在则创建目录
         os.makedirs(filepathdir)
@@ -72,8 +152,10 @@ def down_file(url, filepathdir, filename, filesize):
     else:
         threadnum = sizemb // 10
 
-    # 信号量，同时只允许10个线程运行
-    semlock = threading.BoundedSemaphore(10)
+    if (threadnum == 0):
+        threadnum = 1
+
+    #只有一个线程时，直接一次性下载完整文件
     step = filesize // threadnum
 
     mtd_list = []
@@ -88,7 +170,7 @@ def down_file(url, filepathdir, filename, filesize):
         fileno = f.fileno()
         # 如果文件大小为11字节，那就是获取文件0-10的位置的数据。如果end = 10，说明数据已经获取完了。
         while end < filesize - 1:
-            semlock.acquire()
+            semlockdownload.acquire()
             start = end + 1
             end = start + step - 1
             if end > filesize:
@@ -102,7 +184,12 @@ def down_file(url, filepathdir, filename, filesize):
             #print(fd)
             t = MulThreadDownload(url, start, end, fd)
             t.start()
-            mtd_list.append(t)
+
+            if(threadnum == 1):
+                download_thread_pool.append(t)
+                break
+            else:
+                mtd_list.append(t)
 
         for i in mtd_list:
             i.join()
@@ -187,6 +274,7 @@ def CreateUploadSession(fileName, remotePath):
             else:
                 pull_res = json.loads(pull_res.text)
                 if 'error' in pull_res.keys():
+                    print(pull_res)
                     reacquireToken()
                     pull_res = CreateUploadSession(fileName, remotePath)
                     return pull_res
@@ -198,48 +286,20 @@ def CreateUploadSession(fileName, remotePath):
             time.sleep(20)
 
 
-def putfilesmall(target_filename, fileName, remotePath, times=0):
-    global tokenjson
+def putfilesmall(target_filename, fileName, remotePath, maxwait=50):
+    global upload_thread_pool
 
-    ret = False
-    trytime = 0
+    if len(upload_thread_pool) > maxwait:
+        for i in upload_thread_pool:
+            i.join()
+        upload_thread_pool.clear()
 
-    while True:
-        if remotePath == "None":
-            remotePath = "/"
-        url = config.app_url + \
-            '/v1.0/me/drive/items/root:{}/{}:/content'.format(urllib.parse.quote(remotePath), urllib.parse.quote(fileName))
+    semlockupload.acquire()
+    t = MulThreadUpload(remotePath,fileName,target_filename)
+    t.start()
+    upload_thread_pool.append(t)
 
-        while True:
-            headers = {
-                'Authorization': 'bearer {}'.format(tokenjson["access_token"]),
-                'Content-Type': 'application/octet-stream',
-            }
-            try:
-                pull_res = requests.put(url,
-                                        headers=headers,
-                                        data=open(target_filename, 'rb'), timeout=30)
-                break
-            except Exception as e:
-                if (trytime > 99999):
-                    return False
-                print("putfilesmall connect error try next")
-                print(e.__str__)
-                time.sleep(20)
-                trytime = trytime + 1
-                continue
-
-        pull_res = json.loads(pull_res.text)
-        if 'error' in pull_res.keys():
-            if (trytime > 99999):
-                break
-            print("putfilesmall ret error %s" % pull_res)
-            reacquireToken()
-            trytime = trytime + 1
-        else:
-            ret=True
-            break
-    return ret
+    return True
 
 
 def _file_seek(target_filename, fileName, startlength, length):
@@ -271,7 +331,7 @@ def _uploadPart(target_filename,
     while True:
         while True:
             try:
-                pull_res = requests.put(uploadUrl, headers=headers, data=data, timeout=50)
+                pull_res = requests.put(uploadUrl, headers=headers, data=data, timeout=500)
                 break
             except Exception as e:
                 if (times > trytime):
@@ -298,6 +358,7 @@ def _uploadPart(target_filename,
 def putfilebig(target_filename, fileName, remotePath):
     crsession = CreateUploadSession(fileName, remotePath)
     filesize = os.path.getsize(target_filename)
+    # 遇到Memory Error时，调整一下这里的length大小，避免爆内存
     length = 200 * 1024 * 1024
     offset = 0
     status = ""
@@ -309,44 +370,59 @@ def putfilebig(target_filename, fileName, remotePath):
                 offset = res['offset']
             else:
                 status = 0
+
+    deletefile(target_filename)
     return True
 
 
 def upProcess(localpath, fileName, remotePath="None"):
     print("upload %s" % localpath)
     filesize = os.path.getsize(localpath)
-    if filesize > 4194304:
-        return putfilebig(localpath, fileName, remotePath)
-    else:
-        return putfilesmall(localpath, fileName, remotePath)
+    #if filesize > 4194304:
+    # 这里暂时不使用微软的上传小文件API，这个API在网络不稳定的时候，容易导致突然断线，导致上传的内容不完整
+    return putfilebig(localpath, fileName, remotePath)
+    #else:
+    #    return putfilesmall(localpath, fileName, remotePath)
 
 
 def get_one_file_list(path=''):
     global tokenjson
 
+    times=0
+    trytime=999999999
+
     if path:
-        BaseUrl = config.app_url + '/v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(
-            path)
+        BaseUrl = config.app_url + '/v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(urllib.parse.quote(path))
     else:
         BaseUrl = config.app_url + '/v1.0/me/drive/root/children?expand=thumbnails'
     headers = {'Authorization': 'Bearer {}'.format(tokenjson["access_token"])}
-    try:
-        get_res = requests.get(BaseUrl, headers=headers, timeout=30)
-        get_res = json.loads(get_res.text)
-        if 'error' in get_res.keys():
-            reacquireToken()
-            return get_one_file_list(path)
+    while True:
+        try:
+            get_res = requests.get(BaseUrl, headers=headers, timeout=30)
+            break
+        except Exception as e:
+            if (times > trytime):
+                break
+            print("get_one_file_list error try next")
+            print(e.__str__)
+            time.sleep(20)
+            times = times + 1
+
+    get_res = json.loads(get_res.text)
+    if 'error' in get_res.keys():
+        print("get_one_file_list error %s" % get_res)
+        reacquireToken()
+        return get_one_file_list(path)
+    else:
+        if 'value' in get_res.keys():
+            result = get_res['value']
+            if '@odata.nextLink' in get_res.keys():
+                pageres = get_one_file_list_page(get_res["@odata.nextLink"])
+                result += pageres
+            return {'code': True, 'msg': '获取成功', 'data': result}
         else:
-            if 'value' in get_res.keys():
-                result = get_res['value']
-                if '@odata.nextLink' in get_res.keys():
-                    pageres = get_one_file_list_page(get_res["@odata.nextLink"])
-                    result += pageres
-                return {'code': True, 'msg': '获取成功', 'data': result}
-            else:
-                return None
-    except:
-        return None
+            print("get_one_file_list value is None")
+            return None
 
 
 def get_one_file_list_page(url, total=[]):
@@ -374,6 +450,7 @@ def task_write(data):
         "file_size": data["size"]
     }
     threading.Lock()
+    print("append downloadinfos path:%s filesize:%s" % (dic["path"]+ '/' + dic["name"],dic["file_size"]))
     downloadinfos.append(dic)
     threading.RLock()
 
@@ -383,38 +460,33 @@ def task_getlist(path=''):
     global downloadinfos
     res = get_one_file_list(path)
     thread_list = []  # 线程存放列表
-    try:
-        for i in res["data"]:
-            if "folder" in i.keys():
-                dic = {
-                    "id": i["id"],
-                    "parentReference": i["parentReference"]["id"],
-                    "name": i["name"],
-                    "file": "folder",
-                    "path": i["parentReference"]["path"].replace("/drive/root:", ""),
-                    "is_file": 0
-                }
-                threading.Lock()
-                downloadinfos.append(dic)
-                threading.RLock()
-                t = threading.Thread(target=task_getlist,
-                                     args=(
-                                         tokenjson,
+    for i in res["data"]:
+        if "folder" in i.keys():
+            dic = {
+                "id": i["id"],
+                "parentReference": i["parentReference"]["id"],
+                "name": i["name"],
+                "file": "folder",
+                "path": i["parentReference"]["path"].replace("/drive/root:", ""),
+                "is_file": 0
+            }
+            threading.Lock()
+            downloadinfos.append(dic)
+            threading.RLock()
+            t = threading.Thread(target=task_getlist,
+                                    args=(
                                          "/" + path + "/" + i["name"],
                                      ))
-                thread_list.append(t)
-            else:
-                t = threading.Thread(target=task_write, args=(i,))
-                thread_list.append(t)
-        for t in thread_list:
-            t.start()
-        for t in thread_list:
-            t.join()
+            thread_list.append(t)
+        else:
+            t = threading.Thread(target=task_write, args=(i,))
+            thread_list.append(t)
+    for t in thread_list:
+        t.start()
+    for t in thread_list:
+        t.join()
 
-        return downloadinfos
-    except:
-        print("task_getlist error")
-        task_getlist(path)
+    return downloadinfos
 
 
 def pull_dirve_file(file_id, trytimemax=10000):
@@ -461,6 +533,8 @@ def init():
     global settings
     global tokenstream
     global tokenjson
+    global semlockupload
+    global semlockdownload
 
     # Load the oauth_settings.yml file
     stream = open('oauth_settings.yml', 'r')
@@ -487,4 +561,61 @@ def init():
     if tokenjson == None:
         exit()
 
+    #10个线程下载
+    semlockupload = threading.BoundedSemaphore(10)
+
+    # 信号量，同时只允许10个线程运行
+    semlockdownload = threading.BoundedSemaphore(10)
+
     return tokenjson
+
+def uninit():
+    global upload_thread_pool
+    global download_thread_pool
+
+    #等待所有上传线程结束
+    for i in upload_thread_pool:
+        i.join()
+
+    for i in download_thread_pool:
+        i.join()
+
+def getfiledownloadurl(urlpath):
+    global tokenjson
+    
+    BaseUrl = config.app_url + 'v1.0/me/drive/root:/' + urlpath
+    headers = {'Authorization': 'Bearer {}'.format(tokenjson["access_token"])}
+    try:
+        trytime = 0
+        while True:
+            try:
+                get_res = requests.get(BaseUrl, headers=headers, timeout=30)
+                break
+            except Exception as e:
+                if (trytime > trytimemax):
+                    return None
+                print("get drive file failed, try again")
+                trytime = trytime + 1
+                time.sleep(20)
+        get_res = json.loads(get_res.text)
+        if 'error' in get_res.keys():
+            reacquireToken()
+            return getfiledownloadurl(urlpath)
+        else:
+            if '@microsoft.graph.downloadUrl' in get_res.keys():
+                return {
+                    "name": get_res["name"],
+                    "url": get_res["@microsoft.graph.downloadUrl"],
+                    "file_size": get_res["size"],
+                    "path": get_res["parentReference"]["path"].replace("/drive/root:", "")
+                }
+            else:
+                return None
+    except Exception as e:
+        return None
+
+def isurlfile(urlpath):
+    if getfiledownloadurl(urlpath) is None:
+        return False
+    else:
+        return True

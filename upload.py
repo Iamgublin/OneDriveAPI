@@ -21,7 +21,6 @@ def findfile(root_path, file_list, dir_list):
             tmp["absolutepath"] = res[1].replace('\\', '/')
             file_list.append(tmp)
 
-
 tokenjson = onedriveapi.init()
 if tokenjson is None:
     exit()
@@ -33,11 +32,9 @@ findfile(rootpath, file_list, dir_list)
 for item in file_list:
     remotepath = "/upload" + item["absolutepath"]
     ret = onedriveapi.upProcess(item["filepath"], item["filename"], remotepath)
-    try:
-        if (ret is True):
-            os.remove(item["filepath"])  # 删除文件
-    except Exception as e:
-        print("remove file error %s" % e.__str__)
+
+onedriveapi.uninit()
+
 
 dir_list.reverse()
 for item in dir_list:
