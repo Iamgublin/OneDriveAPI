@@ -1,7 +1,7 @@
 OneDriveAPI
 ======================
 
-## only tested in onedrive business
+## support onedrive and onedrive business
 
 
 upload file
