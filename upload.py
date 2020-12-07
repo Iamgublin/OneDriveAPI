@@ -17,8 +17,10 @@ def findfile(root_path, file_list, dir_list):
             tmp = {}
             res = root_path.split(rootpath)
             tmp["filepath"] = dir_file_path
-            tmp["filename"] = dir_file
-            tmp["absolutepath"] = res[1].replace('\\', '/')
+            #远程目录和文件名去掉非法字符
+            tmp["filename"] = onedriveapi.replacespecialcharactor(dir_file)
+            tmp["absolutepath"] = onedriveapi.replacespecialcharactor(res[1].replace('\\', '/'))
+
             file_list.append(tmp)
 
 tokenjson = onedriveapi.init()

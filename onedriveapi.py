@@ -8,6 +8,7 @@ import time
 import threading
 import urllib
 import copy
+from concurrent.futures import ThreadPoolExecutor
 
 #https://docs.microsoft.com/en-us/onedrive/developer/rest-api/getting-started/graph-oauth?view=odsp-graph-online
 
@@ -21,6 +22,20 @@ upload_thread_pool = []
 download_thread_pool = []
 semlockupload = ""
 tokenjson = {}
+
+upload_big_thread_pool = {}
+
+#" * : < > ? \ / |均为特殊字符  上传时需要替换
+def replacespecialcharactor(remotepath):
+    remotepath = remotepath.replace("*","_")
+    remotepath = remotepath.replace("\"","_")
+    remotepath = remotepath.replace("<","_")
+    remotepath = remotepath.replace(">","_")
+    remotepath = remotepath.replace(":","_")
+    remotepath = remotepath.replace("?","_")
+    remotepath = remotepath.replace("|","_")
+    return remotepath
+
 
 #上传成功时删除文件
 def deletefile(filepath):
@@ -274,7 +289,9 @@ def CreateUploadSession(fileName, remotePath):
             else:
                 pull_res = json.loads(pull_res.text)
                 if 'error' in pull_res.keys():
-                    print(pull_res)
+                    print("[%s] %s" % (fileName, pull_res))
+                    #针对过多请求的情况，尝试休息一下
+                    time.sleep(10)
                     reacquireToken()
                     pull_res = CreateUploadSession(fileName, remotePath)
                     return pull_res
@@ -336,7 +353,7 @@ def _uploadPart(target_filename,
             except Exception as e:
                 if (times > trytime):
                     break
-                print("putfilebig connect error try next")
+                print("[%s] putfilebig connect error try next" % (target_filename))
                 print(e.__str__)
                 time.sleep(20)
                 times = times + 1
@@ -349,7 +366,7 @@ def _uploadPart(target_filename,
             #上传完毕
             return {"code": 0}
         else:
-            print("putfilebig connect error code:%d" % pull_res.status_code)
+            print("[%s] putfilebig connect error code:%d" % (target_filename, pull_res.status_code))
             print(pull_res.text)
             time.sleep(20)
             times = times + 1
@@ -372,6 +389,16 @@ def putfilebig(target_filename, fileName, remotePath):
                 status = 0
 
     deletefile(target_filename)
+    print("upload %s success" % target_filename)
+    return True
+
+#多线程wrapper
+def putfilebigMultiple(target_filename, fileName, remotePath):
+    global upload_big_thread_pool
+
+    ret = upload_big_thread_pool.submit(
+        putfilebig, target_filename, fileName, remotePath)
+
     return True
 
 
@@ -380,7 +407,10 @@ def upProcess(localpath, fileName, remotePath="None"):
     filesize = os.path.getsize(localpath)
     #if filesize > 4194304:
     # 这里暂时不使用微软的上传小文件API，这个API在网络不稳定的时候，容易导致突然断线，导致上传的内容不完整
-    return putfilebig(localpath, fileName, remotePath)
+    #先用多线程上传
+    #return putfilebig(localpath, fileName, remotePath)
+    #TODO:避免流量过大造成链接被阻止 https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online
+    return putfilebigMultiple(localpath, fileName, remotePath)
     #else:
     #    return putfilesmall(localpath, fileName, remotePath)
 
@@ -535,6 +565,7 @@ def init():
     global tokenjson
     global semlockupload
     global semlockdownload
+    global upload_big_thread_pool
 
     # Load the oauth_settings.yml file
     stream = open('oauth_settings.yml', 'r')
@@ -567,6 +598,9 @@ def init():
     # 信号量，同时只允许10个线程运行
     semlockdownload = threading.BoundedSemaphore(10)
 
+    #上传线程池
+    upload_big_thread_pool = ThreadPoolExecutor(max_workers=10)
+
     return tokenjson
 
 def uninit():
@@ -580,6 +614,9 @@ def uninit():
     for i in download_thread_pool:
         i.join()
 
+    #等待线程池执行完毕
+    upload_big_thread_pool.shutdown(wait=True)
+
 def getfiledownloadurl(urlpath):
     global tokenjson
     
@@ -592,8 +629,6 @@ def getfiledownloadurl(urlpath):
                 get_res = requests.get(BaseUrl, headers=headers, timeout=30)
                 break
             except Exception as e:
-                if (trytime > trytimemax):
-                    return None
                 print("get drive file failed, try again")
                 trytime = trytime + 1
                 time.sleep(20)
